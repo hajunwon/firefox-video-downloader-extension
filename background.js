@@ -38,9 +38,8 @@ const MIN_SIZE = 100 * 1024;
 const TIKTOK_MIN_VIDEO_SIZE = 1024 * 1024;
 
 // HLS 세그먼트(.ts) 여부 판별
-// 세그먼트는 개별 다운로드해도 의미 없음 — 재생하려면 .m3u8 매니페스트가 필요
-// 필터 대상: videoN.ts, chunkN.ts, segmentN.ts, seg_N.ts, mediaN.ts,
-//          fragmentN.ts, /chunklist/, /segments/, /playlist/ 경로 포함
+// 세그먼트는 개별적으론 재생 불가하지만, 그룹으로 묶으면 전체 영상이 됨
+// HLS 기반 사이트에서는 이게 유일한 소스일 수 있으므로 그룹 엔트리로 표시
 function isHlsSegment(url) {
   try {
     const u = new URL(url);
@@ -57,6 +56,23 @@ function isHlsSegment(url) {
     return false;
   }
 }
+
+// HLS 세그먼트의 그룹 키: 디렉토리 경로 (hostname + path without filename)
+// 예: https://cdn.example.com/videos/abc/video1.ts → "cdn.example.com/videos/abc/"
+function getHlsGroupKey(url) {
+  try {
+    const u = new URL(url);
+    const pathParts = u.pathname.split("/");
+    pathParts.pop(); // 파일명 제거
+    return u.hostname + pathParts.join("/") + "/";
+  } catch {
+    return url;
+  }
+}
+
+// 탭별 HLS 세그먼트 그룹 추적
+// hlsSegmentGroups[tabId][groupKey] = { firstUrl, count, totalSize, ext }
+const hlsSegmentGroups = {};
 
 function addVideo(tabId, info) {
   if (!detectedVideos[tabId]) {
@@ -149,9 +165,49 @@ browser.webRequest.onHeadersReceived.addListener(
     // TikTok 오디오 트랙은 완전히 제외
     if (isTiktokAudio) return;
 
-    // HLS 세그먼트(.ts)는 개별로는 쓸모없으므로 제외
-    // (m3u8 매니페스트는 별도로 감지되어 표시됨)
-    if (isHlsSegment(url)) return;
+    // HLS 세그먼트(.ts): 그룹으로 묶어서 "HLS 스트림" 단일 엔트리로 표시
+    // (.m3u8 매니페스트는 별도로 감지되어 나란히 표시됨)
+    if (isHlsSegment(url)) {
+      const tabId = details.tabId;
+      const groupKey = getHlsGroupKey(url);
+      if (!hlsSegmentGroups[tabId]) hlsSegmentGroups[tabId] = {};
+      const grp = hlsSegmentGroups[tabId][groupKey];
+      if (!grp) {
+        // 그룹 최초 생성 → detectedVideos에 1개 엔트리 추가
+        hlsSegmentGroups[tabId][groupKey] = {
+          firstUrl: url,
+          count: 1,
+          totalSize: size || 0,
+        };
+        addVideo(tabId, {
+          url,
+          type: "hls-segments",
+          mime,
+          size: size || 0,
+          ext: "ts",
+          isHlsGroup: true,
+          hlsGroupKey: groupKey,
+          segmentCount: 1,
+          timestamp: Date.now(),
+        });
+      } else {
+        // 기존 그룹에 카운트/크기 누적 + detectedVideos 엔트리 업데이트
+        grp.count++;
+        if (size) grp.totalSize += size;
+        const entry = (detectedVideos[tabId] || []).find(
+          (v) => v.isHlsGroup && v.hlsGroupKey === groupKey
+        );
+        if (entry) {
+          entry.segmentCount = grp.count;
+          entry.size = grp.totalSize;
+          // 팝업 갱신은 간헐적으로만 트리거 (매 세그먼트마다 보내면 수십~수백번 재렌더)
+          if (grp.count === 2 || grp.count === 5 || grp.count % 10 === 0) {
+            browser.runtime.sendMessage({ action: "videoAdded", tabId }).catch(() => {});
+          }
+        }
+      }
+      return;
+    }
 
     if (isMimeVideo || isUrlVideo || isStream || isTiktokVideo) {
       // 작은 파일 필터링 (스트림은 크기 무시)
@@ -821,6 +877,7 @@ browser.tabs.onRemoved.addListener((tabId) => {
   delete gridVideoTitles[tabId];
   delete tiktokVideoMeta[tabId];
   delete tiktokFeedByVideoId[tabId];
+  delete hlsSegmentGroups[tabId];
 });
 
 // 탭 이동 시 배지 업데이트
@@ -832,6 +889,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     delete gridVideoTitles[tabId];
     delete tiktokVideoMeta[tabId];
     delete tiktokFeedByVideoId[tabId];
+    delete hlsSegmentGroups[tabId];
     browser.browserAction.setBadgeText({ text: "", tabId });
   }
 });

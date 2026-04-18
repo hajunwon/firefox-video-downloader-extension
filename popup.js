@@ -457,12 +457,14 @@ function buildVideoRow(video, role) {
   const hostname = extractHostname(video.url);
   const isBlob = video.type === "blob";
   const isStream = video.type === "stream";
+  const isHlsGroup = video.isHlsGroup === true;
   const hasTitle = !!resolved;
 
   let typeTags = "";
   if (role === "best") typeTags += `<span class="tag tag-best">BEST</span>`;
   if (isStream) typeTags += `<span class="tag tag-stream">stream</span>`;
   if (isBlob) typeTags += `<span class="tag tag-blob">blob</span>`;
+  if (isHlsGroup) typeTags += `<span class="tag tag-stream">HLS ${video.segmentCount || 1}개 세그먼트</span>`;
   if (hasTitle) typeTags += `<span class="tag tag-source">${escapeHtml(resolved.source)}</span>`;
 
   const safeFilename = sanitizeFilename(displayName, video.ext);
@@ -470,18 +472,26 @@ function buildVideoRow(video, role) {
   let actionBtns;
   if (isBlob) {
     actionBtns = `<span class="blob-hint">ffmpeg 필요</span>`;
+  } else if (isHlsGroup) {
+    // HLS 그룹: m3u8 매니페스트를 받아 ffmpeg로 합쳐야 함
+    actionBtns = `<span class="blob-hint" title="이 영상은 HLS 스트림입니다. 같은 목록에 .m3u8 파일이 있으면 그걸 받아 ffmpeg로 합치세요.">m3u8 + ffmpeg 필요</span>`;
   } else if (video.downloaded) {
     actionBtns = `<button class="download-btn done" data-url="${escapeAttr(video.url)}" data-ext="${video.ext}" data-filename="${escapeAttr(safeFilename)}">다운로드 ✓</button>`;
   } else {
     actionBtns = `<button class="download-btn" data-url="${escapeAttr(video.url)}" data-ext="${video.ext}" data-filename="${escapeAttr(safeFilename)}">다운로드</button>`;
   }
 
+  // HLS 그룹은 URL 대신 디렉토리 경로(세그먼트 prefix)를 표시
+  const displayUrl = isHlsGroup && video.hlsGroupKey
+    ? `HLS 스트림: ${video.hlsGroupKey}`
+    : urlName;
+
   const titleHtml = hasTitle
     ? `<div class="video-title"><span class="scroll-text">${escapeHtml(displayName)}</span></div>
-       <div class="video-url" title="${escapeHtml(video.url)}"><span class="scroll-text">${escapeHtml(urlName)}</span></div>`
-    : `<div class="video-url" title="${escapeHtml(video.url)}"><span class="scroll-text">${escapeHtml(urlName)}</span></div>`;
+       <div class="video-url" title="${escapeHtml(video.url)}"><span class="scroll-text">${escapeHtml(displayUrl)}</span></div>`
+    : `<div class="video-url" title="${escapeHtml(video.url)}"><span class="scroll-text">${escapeHtml(displayUrl)}</span></div>`;
 
-  const canThumb = !isBlob && !isStream;
+  const canThumb = !isBlob && !isStream && !isHlsGroup;
 
   item.innerHTML = `
     <button class="remove-btn" data-url="${escapeAttr(video.url)}" title="목록에서 제거">✕</button>
