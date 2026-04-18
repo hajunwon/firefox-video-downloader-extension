@@ -216,7 +216,23 @@ const tiktokApiPattern =
 // key: URL 경로 지문 (쿼리 제외), value: { videoId, username, nickname, desc, source }
 const tiktokVideoMap = {};
 
+// HLS 세그먼트(.ts) 여부: 개별로는 재생 불가하므로 감지에서 제외
+function isHlsSegment(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname;
+    if (!/\.ts(\?|$)/i.test(path)) return false;
+    if (/\/[^/]*(video|chunk|segment|seg|part|media|fragment|frag)[_-]?\d+\.ts$/i.test(path)) return true;
+    if (/\/(chunklist|segments?|hls|playlist|stream)\//i.test(path)) return true;
+    if (/\/\d+\.ts$/i.test(path)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function isVideoUrl(url) {
+  if (isHlsSegment(url)) return false;
   return videoUrlPattern.test(url) || tiktokCdnPattern.test(url);
 }
 

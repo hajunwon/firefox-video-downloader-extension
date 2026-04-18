@@ -37,6 +37,27 @@ const MIN_SIZE = 100 * 1024;
 // TikTok 비디오 최소 크기 (1MB) - 오디오 트랙/프리뷰 제외
 const TIKTOK_MIN_VIDEO_SIZE = 1024 * 1024;
 
+// HLS 세그먼트(.ts) 여부 판별
+// 세그먼트는 개별 다운로드해도 의미 없음 — 재생하려면 .m3u8 매니페스트가 필요
+// 필터 대상: videoN.ts, chunkN.ts, segmentN.ts, seg_N.ts, mediaN.ts,
+//          fragmentN.ts, /chunklist/, /segments/, /playlist/ 경로 포함
+function isHlsSegment(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname;
+    if (!/\.ts(\?|$)/i.test(path)) return false;
+    // 세그먼트 번호 패턴
+    if (/\/[^/]*(video|chunk|segment|seg|part|media|fragment|frag)[_-]?\d+\.ts$/i.test(path)) return true;
+    // 경로에 스트리밍 디렉토리
+    if (/\/(chunklist|segments?|hls|playlist|stream)\//i.test(path)) return true;
+    // 파일명이 숫자만 (예: 000123.ts, 1234.ts)
+    if (/\/\d+\.ts$/i.test(path)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function addVideo(tabId, info) {
   if (!detectedVideos[tabId]) {
     detectedVideos[tabId] = [];
@@ -127,6 +148,10 @@ browser.webRequest.onHeadersReceived.addListener(
 
     // TikTok 오디오 트랙은 완전히 제외
     if (isTiktokAudio) return;
+
+    // HLS 세그먼트(.ts)는 개별로는 쓸모없으므로 제외
+    // (m3u8 매니페스트는 별도로 감지되어 표시됨)
+    if (isHlsSegment(url)) return;
 
     if (isMimeVideo || isUrlVideo || isStream || isTiktokVideo) {
       // 작은 파일 필터링 (스트림은 크기 무시)
