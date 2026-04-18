@@ -74,6 +74,48 @@ function getHlsGroupKey(url) {
 // hlsSegmentGroups[tabId][groupKey] = { firstUrl, count, totalSize, ext }
 const hlsSegmentGroups = {};
 
+// ---- HLS 다운로드 중 Referer 헤더 주입 ----
+// 많은 CDN(BunnyCDN 등)이 Referer를 확인해 외부 fetch를 403으로 차단.
+// 다운로드 세션 기간 동안 지정된 URL 접두사와 일치하는 요청에 Referer를 덮어씀.
+
+// hlsRefererSessions: Map<sessionId, { referer, origin, urlPrefixes: Set<string> }>
+const hlsRefererSessions = new Map();
+
+function hlsSessionMatches(url) {
+  for (const session of hlsRefererSessions.values()) {
+    for (const prefix of session.urlPrefixes) {
+      if (url.startsWith(prefix)) return session;
+    }
+  }
+  return null;
+}
+
+browser.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const session = hlsSessionMatches(details.url);
+    if (!session) return;
+
+    const headers = details.requestHeaders || [];
+    let hasReferer = false;
+    let hasOrigin = false;
+    for (const h of headers) {
+      const name = h.name.toLowerCase();
+      if (name === "referer") {
+        h.value = session.referer;
+        hasReferer = true;
+      } else if (name === "origin") {
+        h.value = session.origin;
+        hasOrigin = true;
+      }
+    }
+    if (!hasReferer) headers.push({ name: "Referer", value: session.referer });
+    if (!hasOrigin) headers.push({ name: "Origin", value: session.origin });
+    return { requestHeaders: headers };
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking", "requestHeaders"]
+);
+
 // ---- HLS 자동 다운로드 파이프라인 ----
 // m3u8 매니페스트를 파싱하고 모든 세그먼트를 fetch한 뒤 하나의 .ts 파일로 합쳐 저장
 // 외부 ffmpeg 불필요
@@ -159,6 +201,42 @@ async function downloadHlsStream({ m3u8Url, hlsGroupKey, tabId, filename, refere
     }
   }
 
+  // Referer가 없으면 현재 탭의 URL을 사용 (CDN 403 방지)
+  if (!referer && tabId != null) {
+    try {
+      const tab = await browser.tabs.get(tabId);
+      if (tab && tab.url) referer = tab.url;
+    } catch {}
+  }
+
+  // Referer 세션 등록 — 다운로드 기간 동안 매칭되는 URL에 헤더 주입
+  const sessionId = `hls-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let sessionRegistered = false;
+  if (referer) {
+    try {
+      const refUrl = new URL(referer);
+      const origin = refUrl.origin;
+      const urlPrefixes = new Set();
+      try {
+        const u = new URL(m3u8Url);
+        // m3u8의 origin 전체를 대상으로 (세그먼트가 동일 origin에 있음)
+        urlPrefixes.add(u.origin + "/");
+      } catch {}
+      if (urlPrefixes.size > 0) {
+        hlsRefererSessions.set(sessionId, { referer, origin, urlPrefixes });
+        sessionRegistered = true;
+      }
+    } catch {}
+  }
+
+  try {
+    return await runHlsDownload(m3u8Url, tabId, filename);
+  } finally {
+    if (sessionRegistered) hlsRefererSessions.delete(sessionId);
+  }
+}
+
+async function runHlsDownload(m3u8Url, tabId, filename) {
   postHlsProgress(tabId, { stage: "fetching_manifest", url: m3u8Url });
 
   // 매니페스트 fetch (최대 2단계 마스터 체이닝)
