@@ -634,8 +634,20 @@ function processTiktokApiItemBg(tabId, item) {
       if (already) return;
     }
 
-    // 대표 URL 1개만 detectedVideos에 추가 (downloadAddr > playAddr)
-    const primaryUrl = video.downloadAddr || video.playAddr;
+    // 대표 URL 1개만 detectedVideos에 추가
+    // 워터마크 방지: 우선순위는 (1) bitrateInfo의 `lr=unwatermarked` 표시된 URL
+    //                           (2) playAddr (일반적으로 무워터마크)
+    //                           (3) downloadAddr (워터마크 포함 — 최후 수단)
+    let primaryUrl = null;
+    if (Array.isArray(video.bitrateInfo)) {
+      // 가장 높은 비트레이트(첫 엔트리) 중 unwatermarked 표시된 것을 우선
+      const unwatermarked = video.bitrateInfo
+        .map((br) => br.PlayAddr?.UrlList?.[0] || br.playAddr)
+        .find((u) => u && /[?&]lr=unwatermarked(\b|&)/i.test(u));
+      if (unwatermarked) primaryUrl = unwatermarked;
+    }
+    if (!primaryUrl) primaryUrl = video.playAddr || video.downloadAddr;
+
     if (primaryUrl && !primaryUrl.startsWith("blob:")) {
       const ext = guessExtension(primaryUrl, "");
       const isStream = /\.(m3u8|mpd)(\?|$)/i.test(primaryUrl);

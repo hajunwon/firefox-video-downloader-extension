@@ -123,8 +123,16 @@ function scanVideos() {
               }, true);
             }
 
-            // 대표 URL 1개만 detectedVideos에 추가 (downloadAddr > playAddr)
-            const primaryUrl = item.video?.downloadAddr || item.video?.playAddr;
+            // 대표 URL 1개만 detectedVideos에 추가 (워터마크 없는 것 우선)
+            // (1) bitrateInfo의 lr=unwatermarked → (2) playAddr → (3) downloadAddr
+            let primaryUrl = null;
+            if (Array.isArray(item.video?.bitrateInfo)) {
+              const unwatermarked = item.video.bitrateInfo
+                .map((br) => br.PlayAddr?.UrlList?.[0] || br.playAddr)
+                .find((u) => u && /[?&]lr=unwatermarked(\b|&)/i.test(u));
+              if (unwatermarked) primaryUrl = unwatermarked;
+            }
+            if (!primaryUrl) primaryUrl = item.video?.playAddr || item.video?.downloadAddr;
             if (primaryUrl && !primaryUrl.startsWith("blob:") && !found.some((f) => f.url === primaryUrl)) {
               found.push({
                 url: primaryUrl,
