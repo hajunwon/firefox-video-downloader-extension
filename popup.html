@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>Video Downloader</h1>
+    <div class="header-actions">
+      <button id="refresh-btn" title="다시 스캔">↻</button>
+      <button id="clear-btn" title="목록 초기화">✕</button>
+    </div>
+  </div>
+  <div class="toolbar" id="toolbar" style="display:none">
+    <input type="text" id="search" placeholder="파일명, URL, 확장자로 검색...">
+    <div class="filter-row">
+      <select id="sort-by">
+        <option value="size-desc">크기 큰 순</option>
+        <option value="size-asc">크기 작은 순</option>
+        <option value="time-desc">최신순</option>
+        <option value="ext">확장자별</option>
+      </select>
+      <select id="filter-ext">
+        <option value="all">모든 형식</option>
+      </select>
+      <select id="title-source" title="제목 추출 방식">
+        <option value="auto">제목: 자동</option>
+        <option value="full">전체 (작성자+제목+설명)</option>
+        <option value="author-title">작성자 - 제목</option>
+        <option value="video-desc">영상 설명</option>
+        <option value="json-ld">JSON-LD</option>
+        <option value="og:title">og:title</option>
+        <option value="description">설명/캡션</option>
+        <option value="twitter:title">twitter:title</option>
+        <option value="content-disposition">Content-Disposition</option>
+        <option value="video-attr">video 태그 속성</option>
+        <option value="page-title">페이지 제목</option>
+        <option value="url">URL 파일명</option>
+      </select>
+      <span id="video-count" class="video-count"></span>
+    </div>
+  </div>
+  <div id="video-list"></div>
+  <div id="empty-state">
+    <p>감지된 비디오가 없습니다.</p>
+    <p class="hint">비디오가 있는 페이지를 새로고침 해보세요.</p>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

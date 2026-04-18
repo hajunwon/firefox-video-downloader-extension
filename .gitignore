@@ -1,0 +1,30 @@
+# Build artifacts
+*.zip
+*.xpi
+web-ext-artifacts/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node (if tooling added later)
+node_modules/
+package-lock.json
+yarn.lock
+.npm/
+
+# Logs
+*.log
+
+# Local / private
+.env
+.env.local
+memory/
