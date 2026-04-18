@@ -74,6 +74,182 @@ function getHlsGroupKey(url) {
 // hlsSegmentGroups[tabId][groupKey] = { firstUrl, count, totalSize, ext }
 const hlsSegmentGroups = {};
 
+// ---- HLS 자동 다운로드 파이프라인 ----
+// m3u8 매니페스트를 파싱하고 모든 세그먼트를 fetch한 뒤 하나의 .ts 파일로 합쳐 저장
+// 외부 ffmpeg 불필요
+
+const HLS_CONCURRENCY = 5;         // 동시 다운로드 세그먼트 수
+const HLS_MAX_SEGMENTS = 2000;     // 과도한 세그먼트 방지 (약 6시간 분량)
+
+function resolveUrl(target, base) {
+  try { return new URL(target, base).href; } catch { return target; }
+}
+
+// m3u8 텍스트 파싱 → 세그먼트 URL 배열 또는 하위 플레이리스트 URL
+// 반환: { type: "master" | "media", entries: [...] }
+function parseM3u8(text, baseUrl) {
+  const lines = text.split(/\r?\n/);
+  const isMaster = /^#EXT-X-STREAM-INF/m.test(text);
+  if (isMaster) {
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^#EXT-X-STREAM-INF:(.*)$/i);
+      if (!m) continue;
+      const attrs = m[1];
+      const bw = parseInt((attrs.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+      const res = (attrs.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
+      // 다음의 비주석 라인이 실제 URI
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j].trim();
+        if (!line) continue;
+        if (line.startsWith("#")) continue;
+        variants.push({ url: resolveUrl(line, baseUrl), bandwidth: bw, resolution: res });
+        break;
+      }
+    }
+    return { type: "master", entries: variants };
+  }
+  // 미디어 플레이리스트 — 세그먼트 URL 수집
+  const segments = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    segments.push(resolveUrl(line, baseUrl));
+  }
+  return { type: "media", entries: segments };
+}
+
+// 탭에 진행률 알림 전송
+function postHlsProgress(tabId, payload) {
+  browser.runtime.sendMessage({ action: "hlsProgress", tabId, ...payload }).catch(() => {});
+}
+
+async function fetchAsArrayBuffer(url) {
+  const res = await fetch(url, { credentials: "include", cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} @ ${url}`);
+  return await res.arrayBuffer();
+}
+
+// HLS 그룹 다운로드 시: 같은 디렉토리의 m3u8 매니페스트 찾기
+function findMatchingM3u8(tabId, hlsGroupKey) {
+  if (!hlsGroupKey) return null;
+  const videos = detectedVideos[tabId] || [];
+  for (const v of videos) {
+    if (v.ext !== "m3u8") continue;
+    try {
+      const u = new URL(v.url);
+      const prefix = u.hostname + u.pathname.split("/").slice(0, -1).join("/") + "/";
+      if (hlsGroupKey.startsWith(prefix) || prefix.startsWith(hlsGroupKey)) {
+        return v.url;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function downloadHlsStream({ m3u8Url, hlsGroupKey, tabId, filename, referer }) {
+  // 그룹 다운로드 요청이면 매칭되는 m3u8 찾기
+  if (!m3u8Url && hlsGroupKey && tabId != null) {
+    m3u8Url = findMatchingM3u8(tabId, hlsGroupKey);
+    if (!m3u8Url) {
+      throw new Error(
+        "이 HLS 그룹에 해당하는 .m3u8 매니페스트가 감지되지 않았습니다. " +
+        "영상을 잠시 재생한 뒤 다시 시도하세요."
+      );
+    }
+  }
+
+  postHlsProgress(tabId, { stage: "fetching_manifest", url: m3u8Url });
+
+  // 매니페스트 fetch (최대 2단계 마스터 체이닝)
+  let playlistUrl = m3u8Url;
+  let parsed = null;
+  for (let depth = 0; depth < 2; depth++) {
+    const res = await fetch(playlistUrl, { credentials: "include", cache: "no-store" });
+    if (!res.ok) throw new Error(`매니페스트 HTTP ${res.status}`);
+    const text = await res.text();
+    parsed = parseM3u8(text, playlistUrl);
+    if (parsed.type === "master") {
+      if (parsed.entries.length === 0) throw new Error("마스터 플레이리스트가 비어 있음");
+      // 가장 높은 bandwidth 선택
+      parsed.entries.sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+      playlistUrl = parsed.entries[0].url;
+      continue;
+    }
+    break; // media playlist
+  }
+
+  if (!parsed || parsed.type !== "media" || parsed.entries.length === 0) {
+    throw new Error("세그먼트를 찾을 수 없음");
+  }
+
+  const segmentUrls = parsed.entries;
+  if (segmentUrls.length > HLS_MAX_SEGMENTS) {
+    throw new Error(`세그먼트가 너무 많음 (${segmentUrls.length}개). 최대 ${HLS_MAX_SEGMENTS}개까지 지원.`);
+  }
+
+  postHlsProgress(tabId, {
+    stage: "downloading",
+    total: segmentUrls.length,
+    completed: 0,
+  });
+
+  // 순서 보존하며 동시성 제어 fetch
+  const buffers = new Array(segmentUrls.length);
+  let completed = 0;
+  let cursor = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= segmentUrls.length) return;
+      try {
+        buffers[idx] = await fetchAsArrayBuffer(segmentUrls[idx]);
+      } catch (e) {
+        throw new Error(`세그먼트 ${idx + 1}/${segmentUrls.length} 실패: ${e.message}`);
+      }
+      completed++;
+      if (completed % 3 === 0 || completed === segmentUrls.length) {
+        postHlsProgress(tabId, {
+          stage: "downloading",
+          total: segmentUrls.length,
+          completed,
+        });
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(HLS_CONCURRENCY, segmentUrls.length) }, worker);
+  await Promise.all(workers);
+
+  postHlsProgress(tabId, { stage: "merging", total: segmentUrls.length, completed: segmentUrls.length });
+
+  // Blob으로 순서대로 합치기 (ArrayBuffer 복사 없이 참조만)
+  const blob = new Blob(buffers, { type: "video/mp2t" });
+  const objectUrl = URL.createObjectURL(blob);
+
+  // 파일명: .m3u8 → .ts로 치환
+  let outName = filename.replace(/\.(m3u8|mpd|ts)$/i, "") + ".ts";
+  if (!/\.ts$/i.test(outName)) outName += ".ts";
+
+  try {
+    const downloadId = await browser.downloads.download({
+      url: objectUrl,
+      filename: outName,
+      saveAs: true,
+    });
+    activeDownloads[downloadId] = m3u8Url;
+
+    // 다운로드 완료 후 Blob 해제 (몇 초 후)
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+
+    postHlsProgress(tabId, { stage: "done", total: segmentUrls.length, completed: segmentUrls.length });
+  } catch (e) {
+    URL.revokeObjectURL(objectUrl);
+    throw e;
+  }
+}
+
 function addVideo(tabId, info) {
   if (!detectedVideos[tabId]) {
     detectedVideos[tabId] = [];
@@ -574,6 +750,25 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "download") {
     const filename = msg.filename || `video.${msg.ext || "mp4"}`;
     const safeName = sanitizeDownloadFilename(filename);
+
+    // HLS 스트림(.m3u8) 또는 세그먼트 그룹 → 자동 매니페스트 처리 + 세그먼트 병합
+    const isM3u8 = /\.m3u8(\?|$)/i.test(msg.url) || msg.ext === "m3u8";
+    const isHlsGroup = msg.isHlsGroup === true;
+    if (isM3u8 || isHlsGroup) {
+      downloadHlsStream({
+        m3u8Url: isM3u8 ? msg.url : null,
+        hlsGroupKey: isHlsGroup ? msg.hlsGroupKey : null,
+        tabId: msg.tabId || sender.tab?.id,
+        filename: safeName,
+        referer: msg.referer,
+      })
+        .then(() => sendResponse({ success: true }))
+        .catch((err) => {
+          console.error("HLS download failed:", err);
+          sendResponse({ success: false, error: err.message || "HLS 다운로드 실패" });
+        });
+      return true;
+    }
 
     // TikTok CDN URL인 경우 Referer 헤더 주입 예약
     if (TIKTOK_CDN_PATTERNS.test(msg.url)) {

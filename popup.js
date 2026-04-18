@@ -4,6 +4,8 @@ let singleVideoPage = false;
 let gridTitles = {};
 let currentTabId = null;
 let initialized = false;
+// 현재 HLS 다운로드 진행 중인 버튼 (진행률 표시용)
+let activeHlsButton = null;
 
 async function init() {
   const tabs = await browser.tabs.query({ active: true, currentWindow: true });
@@ -26,6 +28,8 @@ async function init() {
   browser.runtime.onMessage.addListener((msg) => {
     if (msg.action === "videoAdded" && msg.tabId === currentTabId) {
       refreshVideos();
+    } else if (msg.action === "hlsProgress" && msg.tabId === currentTabId) {
+      handleHlsProgress(msg);
     }
   });
 
@@ -473,8 +477,9 @@ function buildVideoRow(video, role) {
   if (isBlob) {
     actionBtns = `<span class="blob-hint">ffmpeg 필요</span>`;
   } else if (isHlsGroup) {
-    // HLS 그룹: m3u8 매니페스트를 받아 ffmpeg로 합쳐야 함
-    actionBtns = `<span class="blob-hint" title="이 영상은 HLS 스트림입니다. 같은 목록에 .m3u8 파일이 있으면 그걸 받아 ffmpeg로 합치세요.">m3u8 + ffmpeg 필요</span>`;
+    // HLS 그룹: 같은 경로의 m3u8 자동 매칭 → 브라우저 내에서 세그먼트 병합
+    const hlsAttrs = ` data-hls-group="1" data-hls-key="${escapeAttr(video.hlsGroupKey || "")}"`;
+    actionBtns = `<button class="download-btn"${hlsAttrs} data-url="${escapeAttr(video.url)}" data-ext="ts" data-filename="${escapeAttr(safeFilename)}" title="같은 경로의 .m3u8을 찾아 세그먼트를 합쳐 다운로드">스트림 다운로드</button>`;
   } else if (video.downloaded) {
     actionBtns = `<button class="download-btn done" data-url="${escapeAttr(video.url)}" data-ext="${video.ext}" data-filename="${escapeAttr(safeFilename)}">다운로드 ✓</button>`;
   } else {
@@ -544,24 +549,38 @@ function buildVideoRow(video, role) {
   if (dlBtn) {
     dlBtn.addEventListener("click", async (e) => {
       const btn = e.target;
-      btn.textContent = "다운로드 중...";
+      const isHls = btn.dataset.hlsGroup === "1" || /\.m3u8(\?|$)/i.test(btn.dataset.url);
+      btn.textContent = isHls ? "준비 중..." : "다운로드 중...";
       btn.classList.add("downloading");
+      // HLS 다운로드 진행률을 이 버튼에 바인딩
+      if (isHls) {
+        activeHlsButton = btn;
+      }
       try {
         const resp = await browser.runtime.sendMessage({
           action: "download",
           url: btn.dataset.url,
           ext: btn.dataset.ext,
           filename: btn.dataset.filename,
+          isHlsGroup: btn.dataset.hlsGroup === "1",
+          hlsGroupKey: btn.dataset.hlsKey || null,
+          tabId: currentTabId,
         });
         if (resp && !resp.success) {
-          btn.textContent = "실패 - 재시도";
+          btn.textContent = resp.error ? `실패: ${truncate(resp.error, 40)}` : "실패 - 재시도";
           btn.classList.remove("downloading");
           btn.classList.add("failed");
+        } else if (isHls) {
+          btn.textContent = "저장 대기 중...";
         }
       } catch {
         btn.textContent = "실패 - 재시도";
         btn.classList.remove("downloading");
         btn.classList.add("failed");
+      } finally {
+        if (isHls && activeHlsButton === btn) {
+          // 진행률 이벤트에서 계속 업데이트
+        }
       }
     });
   }
@@ -636,6 +655,30 @@ function escapeAttr(str) {
 function truncate(str, max) {
   if (!str) return "";
   return str.length > max ? str.substring(0, max).trim() + "..." : str;
+}
+
+function handleHlsProgress(msg) {
+  const btn = activeHlsButton;
+  if (!btn) return;
+  switch (msg.stage) {
+    case "fetching_manifest":
+      btn.textContent = "매니페스트 가져오는 중...";
+      break;
+    case "downloading": {
+      const pct = msg.total > 0 ? Math.floor((msg.completed / msg.total) * 100) : 0;
+      btn.textContent = `다운로드 ${msg.completed}/${msg.total} (${pct}%)`;
+      break;
+    }
+    case "merging":
+      btn.textContent = "파일 합치는 중...";
+      break;
+    case "done":
+      btn.textContent = "저장 중... ✓";
+      btn.classList.remove("downloading");
+      btn.classList.add("done");
+      activeHlsButton = null;
+      break;
+  }
 }
 
 init();
